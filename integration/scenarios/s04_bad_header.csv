@@ -1,0 +1,3 @@
+object_type,catalog,schema,table
+TABLE,po_ctl_t2,finance,ledger
+CATALOG,po_ctl_t2,,

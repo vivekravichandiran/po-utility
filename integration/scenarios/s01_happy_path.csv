@@ -1,0 +1,5 @@
+object_type,catalog,schema,table,action
+CATALOG,po_ctl_t2,,,DISABLE
+SCHEMA,po_ctl_t1,sales_stage,,ENABLE
+TABLE,po_ctl_t1,sales_curated,orders,DISABLE
+TABLE,po_ctl_t1,sales_curated,customers,ENABLE

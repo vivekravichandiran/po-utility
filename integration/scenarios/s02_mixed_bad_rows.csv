@@ -1,0 +1,17 @@
+object_type,catalog,schema,table,action
+TABLE,po_ctl_t1,sales_curated,orders,DISABLE
+table,PO_CTL_T1,Sales_Curated,ORDERS,disable
+SCHEMA,po_ctl_t2,finance,,ENABLE
+SCHEMA,po_ctl_t2,finance,,DISABLE
+TABLE,po_ctl_t1,sales_curated,,ENABLE
+VIEW,po_ctl_t1,sales_curated,v_orders,ENABLE
+TABLE,po_ctl_t1,sales_curated,orders,INHERIT
+TABLE,po_ctl_t1,sales_curated,v_orders,ENABLE
+TABLE,po_ctl_t1,sales_curated,no_such_table,ENABLE
+TABLE,po_ctl_t1,sales_curated,we`ird,ENABLE
+TABLE,po_ctl_t1,sales_curated,x; DROP TABLE po_ctl_t1.sales_curated.orders,ENABLE
+TABLE,po_ctl_t1,sales_curated,x;DROP-TABLE,ENABLE
+TABLE,po_ctl_t1,sales_curated,=cmd|calc,ENABLE
+CATALOG,po_ctl_t1,,,DISABLE
+TABLE,po_ctl_t1,sales_curated,customers,DISABLE
+TABLE,po_ctl_t1,sales_curated

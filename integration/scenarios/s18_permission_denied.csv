@@ -1,0 +1,6 @@
+object_type,catalog,schema,table,action
+TABLE,po_ctl_t2,finance,ledger,DISABLE
+SCHEMA,po_ctl_t3,locked,,DISABLE
+TABLE,po_ctl_t3,locked,secret_tbl,DISABLE
+CATALOG,po_ctl_t3,,,DISABLE
+SCHEMA,po_ctl_t1,sales_stage,,DISABLE

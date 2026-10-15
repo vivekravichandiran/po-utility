@@ -1,0 +1,5 @@
+object_type,catalog,schema,table,action
+CATALOG,finance,,,DISABLE
+SCHEMA,sales,staging,,ENABLE
+TABLE,sales,curated,orders,DISABLE
+TABLE,sales,curated,customers,ENABLE
