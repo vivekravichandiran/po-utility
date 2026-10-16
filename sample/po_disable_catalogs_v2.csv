@@ -1,0 +1,3 @@
+object_type,catalog,schema,table,action,workspace
+CATALOG,catalog_src_g9c6nd,,,ENABLE,remote
+CATALOG,ril_uc_demo,,,DISABLE,local

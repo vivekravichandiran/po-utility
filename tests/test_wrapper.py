@@ -28,7 +28,9 @@ def cfg(**over):
 
 
 # ------------------------------------------------------------ the widget surface
-EXPECTED_WIDGETS = {"csv_path", "report_path", "compute_type", "all_purpose_cluster_id"}
+REMOTE_WIDGETS = {"remote_workspace_url", "remote_client_id", "remote_secret_scope", "remote_secret_key",
+                  "remote_warehouse_id"}
+EXPECTED_WIDGETS = {"csv_path", "report_path", "compute_type", "all_purpose_cluster_id"} | REMOTE_WIDGETS
 REMOVED_WIDGETS = (
     "job_cluster_spark_version", "job_cluster_node_type_id", "job_cluster_num_workers", "job_mode",
     "job_name_prefix", "max_wait_minutes", "overwrite_report", "volume_root", "wait_for_completion",
@@ -60,11 +62,14 @@ def make_widgets(monkeypatch):
     return FakeDbutils.widgets.created
 
 
-def test_only_the_four_needed_widgets_are_created(monkeypatch):
+def test_only_the_needed_widgets_are_created(monkeypatch):
     created = make_widgets(monkeypatch)
     assert set(created) == EXPECTED_WIDGETS
     for gone in REMOVED_WIDGETS:
         assert gone not in created
+    # the OAuth secret itself is never a widget (widget values become visible job parameters)
+    assert not any(name.endswith(("client_secret", "secret_value", "password", "token")) for name in created)
+    assert all(created[name][1] == "" for name in REMOTE_WIDGETS)  # blank default = local only
 
 
 def test_create_widgets_creates_every_widget_main_reads(monkeypatch):
@@ -277,7 +282,7 @@ def test_job_spec_is_single_task_serverless():
     for forbidden in ("new_cluster", "existing_cluster_id", "job_cluster_key"):
         assert forbidden not in task
     assert "job_clusters" not in spec
-    assert not any(k in str(spec).lower() for k in ("token", "password", "secret"))
+    assert not any(k in str(spec).lower() for k in ("token", "password", "client_secret", "secret_value"))
 
 
 def test_job_spec_never_allows_automatic_task_retry():
@@ -595,3 +600,76 @@ def test_wrapper_accepts_uc_capable_access_modes(mode):
     c = ClusterFake(cluster={"data_security_mode": mode})
     p.run_wrapper(c, cfg(compute_type="all_purpose", all_purpose_cluster_id="0101-abc"), sleep=quiet, log=quiet)
     assert [x[0] for x in c.calls] == ["create", "run_now"]
+
+
+# ============================================================ remote workspace settings
+URL = "https://adb-1234567890123456.7.azuredatabricks.net"
+REMOTE = dict(remote_workspace_url=URL, remote_client_id="11111111-2222-3333-4444-555555555555",
+              remote_secret_scope="po-scope", remote_secret_key="po-key", remote_warehouse_id="abcdef0123456789")
+
+
+def test_remote_defaults_to_disabled():
+    c = cfg()
+    assert c["remote"] is None
+    bp = p.build_job_spec(c)["tasks"][0]["notebook_task"]["base_parameters"]
+    for k in REMOTE_WIDGETS:
+        assert bp[k] == ""  # worker widgets always exist, blank = local only
+
+
+def test_remote_settings_are_normalized_and_passed_to_the_worker():
+    c = cfg(**dict(REMOTE, remote_workspace_url="  " + URL + "/?o=1  ", remote_warehouse_id=" abcdef0123456789 "))
+    assert c["remote"] == {"workspace_url": URL, "client_id": REMOTE["remote_client_id"],
+                           "secret_scope": "po-scope", "secret_key": "po-key",
+                           "warehouse_id": "abcdef0123456789"}
+    bp = p.build_job_spec(c)["tasks"][0]["notebook_task"]["base_parameters"]
+    assert {k: bp[k] for k in REMOTE_WIDGETS} == REMOTE
+    assert bp["csv_path"].endswith(".csv")  # other parameters untouched
+
+
+def test_remote_settings_work_with_every_compute_type():
+    for compute, extra in (("serverless", {}), ("job_cluster", {}),
+                           ("all_purpose", {"all_purpose_cluster_id": "0101-abc"})):
+        spec = p.build_job_spec(cfg(compute_type=compute, **extra, **REMOTE))
+        bp = spec["tasks"][0]["notebook_task"]["base_parameters"]
+        assert bp["remote_workspace_url"] == URL and bp["compute_type"] == compute
+
+
+@pytest.mark.parametrize("blank", sorted(REMOTE_WIDGETS))
+def test_partial_remote_settings_are_rejected_before_anything_is_created(blank):
+    c = FakeClient()
+    with pytest.raises(p.ConfigError, match="incomplete.*%s" % blank):
+        p.run_wrapper(c, cfg(**dict(REMOTE, **{blank: ""})), sleep=quiet, log=quiet)
+    assert c.calls == []
+
+
+@pytest.mark.parametrize("over,frag", [
+    (dict(remote_workspace_url="https://evil.example.com"), "Databricks workspace host"),
+    (dict(remote_workspace_url="http://adb-1.2.azuredatabricks.net"), "https://"),
+    (dict(remote_workspace_url="adb-1.2.azuredatabricks.net"), "https://"),
+    (dict(remote_workspace_url="https://u:p@adb-1.2.azuredatabricks.net"), "credentials"),
+    (dict(remote_secret_scope="bad scope"), "remote_secret_scope"),
+    (dict(remote_secret_key="../x"), "remote_secret_key"),
+    (dict(remote_warehouse_id="my warehouse"), "remote_warehouse_id"),
+    (dict(remote_warehouse_id="abc"), "remote_warehouse_id"),
+    (dict(remote_client_id="a b"), "remote_client_id"),
+])
+def test_invalid_remote_settings(over, frag):
+    with pytest.raises(p.ConfigError, match=frag):
+        cfg(**dict(REMOTE, **over))
+
+
+def test_remote_settings_do_not_change_the_rest_of_the_job_spec():
+    plain = p.build_job_spec(cfg())
+    remote = p.build_job_spec(cfg(**REMOTE))
+    strip = lambda sp: {k: v for k, v in sp["tasks"][0]["notebook_task"]["base_parameters"].items()
+                        if k not in REMOTE_WIDGETS}
+    assert strip(plain) == strip(remote)
+    assert {k: v for k, v in plain.items() if k != "tasks"} == {k: v for k, v in remote.items() if k != "tasks"}
+    assert plain["tasks"][0]["max_retries"] == remote["tasks"][0]["max_retries"] == 0
+
+
+def test_run_with_remote_settings_creates_and_runs_the_job():
+    c = FakeClient()
+    res = p.run_wrapper(c, cfg(**REMOTE), sleep=quiet, log=quiet)
+    assert [x[0] for x in c.calls] == ["create", "run_now"] and res["result_state"] == "SUCCESS"
+    assert c.calls[0][1]["tasks"][0]["notebook_task"]["base_parameters"]["remote_warehouse_id"] == "abcdef0123456789"

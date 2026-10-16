@@ -1,0 +1,5 @@
+object_type,catalog,schema,table,action,workspace
+SCHEMA,po_ctl_t1,sales_stage,,ENABLE,local
+TABLE,po_ctl_t1,sales_curated,orders,DISABLE,remote
+CATALOG,po_ctl_t2,,,DISABLE,remote
+TABLE,po_ctl_t1,sales_curated,customers,ENABLE,local

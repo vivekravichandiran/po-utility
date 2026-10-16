@@ -138,7 +138,9 @@ def test_validate_row_normalizes_case_and_whitespace():
         (["TABLE", "c.s", "s", "t", "ENABLE"], "'.'"),
         (["TABLE", "c", "s p", "t", "ENABLE"], "whitespace"),
         (["TABLE", "c", "s", "a/b", "ENABLE"], "'/'"),
-        (["TABLE", "c", "s", "t", "ENABLE", "extra"], "Row has 6 fields"),
+        (["TABLE", "c", "s", "t", "ENABLE", "extra"], "workspace 'extra' not allowed"),
+        (["TABLE", "c", "s", "t", "ENABLE", ""], "workspace '' not allowed"),
+        (["TABLE", "c", "s", "t", "ENABLE", "local", "x"], "Row has 7 fields"),
         (["TABLE", "c"], "Row has 2 fields"),
     ],
 )
@@ -478,7 +480,8 @@ def test_long_error_truncated_and_logged_in_full(vol):
     w.run_worker(root + "/ops.csv", root + "/r.xlsx", root,
                  FakeSpark({"`t`": RuntimeError(long_msg)}).sql, log=logs.append)
     wb = openpyxl.load_workbook(real(tmp, root + "/r.xlsx"))
-    msg = list(wb["Details"].iter_rows(min_row=2, values_only=True))[0][12]
+    rows = list(wb["Details"].iter_rows(min_row=2, values_only=True))
+    msg = rows[0][w.DETAIL_COLUMNS.index("error_message")]
     assert len(msg) <= 32767 and "TRUNCATED" in msg
     assert any(long_msg in entry for entry in logs)
 

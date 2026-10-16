@@ -15,6 +15,14 @@
 # MAGIC   * `job_cluster` - a new single-node classic job cluster: DBR 17.3 LTS on `Standard_D4s_v3`.
 # MAGIC   * `all_purpose` - an existing all-purpose cluster.
 # MAGIC * `all_purpose_cluster_id` - required for `all_purpose`, must be blank otherwise.
+# MAGIC * Remote workspace (all five blank = local only; otherwise all five are required). Used by CSV rows
+# MAGIC   whose `workspace` column is `remote`; rows marked `local` run on the compute chosen above:
+# MAGIC   * `remote_workspace_url` - e.g. `https://adb-1234567890123456.7.azuredatabricks.net`
+# MAGIC   * `remote_client_id` - client (application) ID of an OAuth service principal in that workspace
+# MAGIC   * `remote_secret_scope`, `remote_secret_key` - the secret that holds the OAuth client **secret**.
+# MAGIC     The secret itself is never typed into a widget (widget values become visible job parameters);
+# MAGIC     the worker reads it from the secret scope at run time.
+# MAGIC   * `remote_warehouse_id` - ID of a SQL warehouse in that workspace the service principal can use
 # MAGIC
 # MAGIC **Fixed behaviour (no widgets)**
 # MAGIC * The job is always named `po-control` and is created, or updated (definition overwritten) if it
@@ -40,6 +48,12 @@ def create_widgets():  # pragma: no cover - needs the Databricks `dbutils` objec
     dbutils.widgets.dropdown("compute_type", "serverless", list(COMPUTE_TYPES), "compute_type")
     # all_purpose only: the existing all-purpose cluster the job will run on (required there).
     dbutils.widgets.text("all_purpose_cluster_id", "", "all_purpose_cluster_id (if compute_type=all_purpose)")
+    # Remote workspace, used by CSV rows with workspace=remote. All blank = local only.
+    dbutils.widgets.text("remote_workspace_url", "", "remote_workspace_url (https://adb-....azuredatabricks.net)")
+    dbutils.widgets.text("remote_client_id", "", "remote_client_id (OAuth service principal client ID)")
+    dbutils.widgets.text("remote_secret_scope", "", "remote_secret_scope (holds the OAuth client secret)")
+    dbutils.widgets.text("remote_secret_key", "", "remote_secret_key (key of the OAuth client secret)")
+    dbutils.widgets.text("remote_warehouse_id", "", "remote_warehouse_id (SQL warehouse in the remote workspace)")
 
 
 if __name__ == "__main__":  # true inside a Databricks notebook, false when imported by the tests
@@ -50,7 +64,9 @@ if __name__ == "__main__":  # true inside a Databricks notebook, false when impo
 import json
 import os
 import posixpath
+import re
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
@@ -61,6 +77,14 @@ WORKER_NOTEBOOK_NAME = "po_worker"  # always the sibling of this notebook
 MAX_WAIT_MINUTES = 180  # polling bound only; the run is never cancelled
 JOB_CLUSTER_SPARK_VERSION = "17.3.x-scala2.13"  # DBR 17.3 LTS
 JOB_CLUSTER_NODE_TYPE_ID = "Standard_D4s_v3"  # Dsv3 series; the job cluster is always single node
+REMOTE_WIDGETS = ("remote_workspace_url", "remote_client_id", "remote_secret_scope", "remote_secret_key",
+                  "remote_warehouse_id")
+# The OAuth client secret is sent to this host by the worker, so only Databricks workspace hosts are accepted.
+REMOTE_HOST_SUFFIXES = (".azuredatabricks.net", ".cloud.databricks.com", ".gcp.databricks.com",
+                        ".databricks.azure.cn", ".databricks.azure.us", ".cloud.databricks.us")
+_HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)+$")
+_SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,128}$")
+_WAREHOUSE_ID_RE = re.compile(r"^[A-Za-z0-9]{8,64}$")
 REPORT_FILE_PREFIX = "po_report_"  # report file: <report_path>/po_report_<UTC timestamp>.xlsx
 TASK_KEY = "execute_po_operations"
 ENVIRONMENT_KEY = "po_env"
@@ -123,6 +147,65 @@ def sibling_worker_path(wrapper_notebook_path: str) -> str:
     return posixpath.join(posixpath.dirname(wrapper), WORKER_NOTEBOOK_NAME)
 
 
+def normalize_workspace_url(value) -> str:
+    """'https://<host>' for a Databricks workspace URL, else ConfigError (same rules as the worker)."""
+    raw = str(value if value is not None else "").strip()
+    if not raw:
+        raise ConfigError("remote_workspace_url must not be empty")
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        raise ConfigError("remote_workspace_url contains illegal characters")
+    try:
+        parts = urllib.parse.urlsplit(raw)
+        port = parts.port
+    except ValueError:
+        raise ConfigError("remote_workspace_url is not a valid URL")
+    if parts.scheme.lower() != "https":
+        raise ConfigError("remote_workspace_url must start with https://")
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        raise ConfigError("remote_workspace_url must not contain credentials")
+    if port not in (None, 443):
+        raise ConfigError("remote_workspace_url must not specify a port other than 443")
+    if parts.path not in ("", "/"):
+        raise ConfigError("remote_workspace_url must be just the workspace URL (https://<host>), no path")
+    host = (parts.hostname or "").lower()
+    if not _HOST_RE.match(host) or not host.endswith(REMOTE_HOST_SUFFIXES):
+        raise ConfigError(
+            "remote_workspace_url host %r is not a Databricks workspace host (expected one ending in %s)"
+            % (host, ", ".join(REMOTE_HOST_SUFFIXES))
+        )
+    return "https://" + host
+
+
+def validate_remote(url, client_id, secret_scope, secret_key, warehouse_id) -> Optional[Dict[str, str]]:
+    """None when all five are blank (local only); a normalized dict when all are valid; else ConfigError."""
+    values = dict(zip(REMOTE_WIDGETS, (url, client_id, secret_scope, secret_key, warehouse_id)))
+    values = {k: str(v if v is not None else "").strip() for k, v in values.items()}
+    if not any(values.values()):
+        return None
+    missing = [k for k, v in values.items() if not v]
+    if missing:
+        raise ConfigError(
+            "remote workspace settings are incomplete, missing: %s (fill all five, or clear all five "
+            "for local-only runs)" % ", ".join(missing)
+        )
+    url_norm = normalize_workspace_url(values["remote_workspace_url"])
+    cid = values["remote_client_id"]
+    if len(cid) > 128 or any(ch.isspace() or ord(ch) < 32 for ch in cid):
+        raise ConfigError("remote_client_id must be at most 128 characters without whitespace")
+    for label in ("remote_secret_scope", "remote_secret_key"):
+        if not _SECRET_NAME_RE.match(values[label]):
+            raise ConfigError("%s must be 1-128 characters of letters, digits, '_', '-' or '.'" % label)
+    if not _WAREHOUSE_ID_RE.match(values["remote_warehouse_id"]):
+        raise ConfigError("remote_warehouse_id must be 8-64 letters/digits (the warehouse ID, not its name)")
+    return {
+        "workspace_url": url_norm,
+        "client_id": cid,
+        "secret_scope": values["remote_secret_scope"],
+        "secret_key": values["remote_secret_key"],
+        "warehouse_id": values["remote_warehouse_id"],
+    }
+
+
 def volume_root_of(path: str, label: str) -> str:
     """'/Volumes/<catalog>/<schema>/<volume>' that contains `path` (which must be a file in it)."""
     parts = [p for p in path.split("/") if p]
@@ -137,6 +220,11 @@ def validate_config(
     worker_notebook_path,
     compute_type="serverless",
     all_purpose_cluster_id="",
+    remote_workspace_url="",
+    remote_client_id="",
+    remote_secret_scope="",
+    remote_secret_key="",
+    remote_warehouse_id="",
     now: Optional[datetime] = None,
     exists: Callable[[str], bool] = os.path.exists,
     isfile: Callable[[str], bool] = os.path.isfile,
@@ -192,9 +280,13 @@ def validate_config(
             "compute_type=all_purpose or clear it (no silent fallback either way)" % compute
         )
 
+    remote = validate_remote(remote_workspace_url, remote_client_id, remote_secret_scope,
+                             remote_secret_key, remote_warehouse_id)
+
     return {
         "compute_type": compute,
         "cluster": cluster,
+        "remote": remote,
         "volume_root": root,
         "csv_path": csv_norm,
         "report_folder": report_dir,
@@ -226,6 +318,18 @@ def _job_cluster_spec(cluster: Dict[str, object]) -> Dict[str, object]:
     return spec
 
 
+def _remote_parameters(remote: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Worker parameters for the remote workspace (blank when local only). Never the secret value."""
+    r = remote or {}
+    return {
+        "remote_workspace_url": r.get("workspace_url", ""),
+        "remote_client_id": r.get("client_id", ""),
+        "remote_secret_scope": r.get("secret_scope", ""),
+        "remote_secret_key": r.get("secret_key", ""),
+        "remote_warehouse_id": r.get("warehouse_id", ""),
+    }
+
+
 def build_job_spec(cfg: Dict[str, object]) -> Dict[str, object]:
     """Jobs API 2.1 payload for a one-task notebook job. Compute is chosen explicitly.
 
@@ -254,6 +358,7 @@ def build_job_spec(cfg: Dict[str, object]) -> Dict[str, object]:
                 "volume_root": cfg["volume_root"],
                 "overwrite_report": "false",  # reports are never overwritten
                 "compute_type": compute,
+                **_remote_parameters(cfg.get("remote")),
                 "job_id": "{{job.id}}",
                 "run_id": "{{job.run_id}}",
             },
@@ -526,6 +631,9 @@ def main():  # pragma: no cover - runs only inside Databricks
     cfg = validate_config(
         g("csv_path"), g("report_path"), sibling_worker_path(wrapper_path),
         g("compute_type"), g("all_purpose_cluster_id"),
+        remote_workspace_url=g("remote_workspace_url"), remote_client_id=g("remote_client_id"),
+        remote_secret_scope=g("remote_secret_scope"), remote_secret_key=g("remote_secret_key"),
+        remote_warehouse_id=g("remote_warehouse_id"),
     )
     print("Validated configuration: %s" % cfg)
     client = JobsClient(WorkspaceClient())
